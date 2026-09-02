@@ -48,6 +48,13 @@ export interface LaunchOptions {
   dropEmbeddings?: boolean;
   springActuatorPath?: string;
   registryName?: string;
+  /**
+   * Branch/ref this run indexes (#2106 index-branch selector). Threaded
+   * straight through to `AnalyzeOptions.branch` — the clone step already
+   * checked the working tree out to this branch, so the pipeline's
+   * checked-out-branch guard passes.
+   */
+  branch?: string;
 }
 
 const MAX_WORKER_RETRIES = 2;
@@ -337,6 +344,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           dropEmbeddings: !!opts.dropEmbeddings,
           ...(opts.springActuatorPath ? { springActuatorPath: opts.springActuatorPath } : {}),
           ...(opts.registryName ? { registryName: opts.registryName } : {}),
+          ...(opts.branch ? { branch: opts.branch } : {}),
         },
       });
     };

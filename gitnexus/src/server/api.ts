@@ -65,6 +65,7 @@ import {
   GITHUB_TOKEN_HOSTS,
 } from './git-clone.js';
 import { createAnalyzeUploadHandler } from './analyze-upload.js';
+import { validateBranchName, GitNexusRcError } from '../cli/analyze-config.js';
 import {
   assertServeAuthForPublicOrigin,
   createPublicOriginMatcher,
@@ -758,6 +759,33 @@ export function validateAnalyzeToken(
   }
   if (!GITHUB_TOKEN_HOSTS.has(tokenHost))
     return { status: 400, error: '"token" is only supported for github.com URLs' };
+  return null;
+}
+
+/**
+ * Validate the optional `branch` field of POST /api/analyze. Returns an
+ * { status, error } to send, or null when the branch is absent or valid.
+ *
+ * Reuses the CLI's `--branch` validation (git ref-name rules, no hidden/
+ * control characters, no leading `-`) so a branch accepted here behaves
+ * identically once it reaches the same `AnalyzeOptions.branch` field the CLI
+ * populates. Only meaningful with `url` — a local path is analyzed as
+ * checked out on disk, same as the CLI.
+ */
+export function validateAnalyzeBranch(
+  repoBranch: unknown,
+  repoUrl: unknown,
+): { status: number; error: string } | null {
+  if (repoBranch === undefined) return null;
+  if (typeof repoBranch !== 'string') return { status: 400, error: '"branch" must be a string' };
+  if (!repoUrl || typeof repoUrl !== 'string')
+    return { status: 400, error: '"branch" requires "url"' };
+  try {
+    validateBranchName(repoBranch, '"branch"');
+  } catch (err) {
+    if (err instanceof GitNexusRcError) return { status: 400, error: err.message };
+    throw err;
+  }
   return null;
 }
 
@@ -1501,6 +1529,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           dropEmbeddings,
           springActuatorPath,
           token: repoToken,
+          branch: repoBranch,
         } = req.body;
 
         // Input type validation
@@ -1532,6 +1561,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           res.status(tokenError.status).json({ error: tokenError.error });
           return;
         }
+
+        // Branch: optional, git ref-name rules (see validateAnalyzeBranch).
+        // Only meaningful alongside "url" — defaults to the remote's default
+        // branch when omitted, same as a plain `git clone`.
+        const branchError = validateAnalyzeBranch(repoBranch, repoUrl);
+        if (branchError) {
+          res.status(branchError.status).json({ error: branchError.error });
+          return;
+        }
+        // Trimmed the same way the CLI's `--branch` normalizes (validated
+        // above via the same rules) — whitespace-padded input must not
+        // false-reject the checked-out-branch guard downstream.
+        const trimmedBranch: string | undefined =
+          typeof repoBranch === 'string' ? repoBranch.trim() : undefined;
 
         // Path validation. The previous `normalize !== resolve` guard was inert
         // (both collapse `..` identically) and only false-rejected trailing
@@ -1594,7 +1637,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     progress: { phase: progress.phase, percent: 5, message: progress.message },
                   });
                 },
-                repoToken ? { token: repoToken } : undefined,
+                repoToken || trimmedBranch
+                  ? { token: repoToken, branch: trimmedBranch }
+                  : undefined,
               );
             }
 
@@ -1607,6 +1652,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               embeddings,
               dropEmbeddings,
               springActuatorPath,
+              branch: repoUrl ? trimmedBranch : undefined,
             });
           } catch (err: any) {
             if (targetPath) releaseRepoLock(getStoragePath(targetPath));

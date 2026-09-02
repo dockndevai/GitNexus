@@ -10,7 +10,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { isIP } from 'net';
 import { logger } from '../core/logger.js';
-import { parseRepoNameFromUrl, stripUrlCredentials } from '../storage/git.js';
+import { parseRepoNameFromUrl, stripUrlCredentials, getCurrentBranch } from '../storage/git.js';
 import { getGlobalDir } from '../storage/repo-manager.js';
 
 /**
@@ -300,8 +300,14 @@ export function warnIfInsecureAzureConfig(): void {
   }
 }
 
-export function buildCloneArgs(url: string, targetDir: string): string[] {
-  return ['clone', '--depth', '1', '--', url, targetDir];
+export function buildCloneArgs(url: string, targetDir: string, branch?: string): string[] {
+  // `--branch` takes the following token unconditionally as its value (git
+  // does not re-parse it as an option), so this is safe even for a branch
+  // name an attacker crafted to look like a flag. Omitted entirely when no
+  // branch is requested, which clones the remote's default branch — same as
+  // before this parameter existed.
+  const branchArgs = branch ? ['--branch', branch] : [];
+  return ['clone', '--depth', '1', ...branchArgs, '--', url, targetDir];
 }
 
 /**
@@ -419,10 +425,17 @@ export async function assertRemoteMatchesRequestedUrl(
 }
 
 /**
- * Clone or pull a git repository.
- * If targetDir doesn't exist: git clone --depth 1
- * If targetDir exists with .git: git pull --ff-only (after verifying the
- * existing clone's remote.origin matches the requested URL).
+ * Clone or pull a git repository, optionally pinned to a branch/ref.
+ * If targetDir doesn't exist: git clone --depth 1 [--branch <branch>]
+ * If targetDir exists with .git:
+ *   - no branch requested: git pull --ff-only (tracks whatever is checked out)
+ *   - branch requested: git fetch --depth 1 origin <branch>, then checkout -B
+ *     from the resulting origin/<branch> — so a target dir reused across jobs
+ *     ends up on the requested branch (with upstream tracking set up)
+ *     regardless of what it was on before, matching the fresh-clone behavior
+ *     above.
+ * When branch is omitted, the remote's default branch is used — unchanged
+ * from before this parameter existed.
  *
  * Security:
  *   - targetDir must resolve inside CLONE_ROOT (~/.gitnexus/repos/). The
@@ -446,7 +459,7 @@ export async function cloneOrPull(
   url: string,
   targetDir: string,
   onProgress?: (progress: CloneProgress) => void,
-  options?: { token?: string },
+  options?: { token?: string; branch?: string },
 ): Promise<string> {
   // Containment barrier — inline with the canonical path.relative idiom so
   // CodeQL recognizes the sanitizer at every following filesystem and
@@ -480,12 +493,59 @@ export async function cloneOrPull(
     // requested. Without this check, a pull would silently succeed against
     // whatever remote the dir was originally cloned from.
     await assertRemoteMatchesRequestedUrl(safeTarget, url);
-    onProgress?.({ phase: 'pulling', message: 'Pulling latest changes...' });
-    await runGit(['pull', '--ff-only'], safeTarget, { token: options?.token, url });
+    // Resolve which branch this pull targets: the requested one, or whatever
+    // is currently checked out (covers the common no-branch-requested case,
+    // AND a target dir a previous job pinned to a branch via `--branch`).
+    // `null` only for a detached HEAD, which falls back to the pre-existing
+    // `git pull --ff-only` behavior below.
+    const targetBranch = options?.branch ?? getCurrentBranch(safeTarget) ?? undefined;
+    if (targetBranch) {
+      onProgress?.({ phase: 'pulling', message: `Fetching ${targetBranch}...` });
+      // Explicit `+<branch>:refs/remotes/origin/<branch>` destination refspec
+      // (not a bare `origin <branch>`, which only updates FETCH_HEAD): a
+      // clone made with `--branch` restricts `remote.origin.fetch` to that
+      // one branch (git implies `--single-branch` whenever `--depth` is
+      // given), so a later request naming a DIFFERENT branch would otherwise
+      // never populate its remote-tracking ref. The explicit destination
+      // works regardless of that restriction. The leading `+` forces the
+      // remote-tracking ref to update even when git's local (shallow-limited)
+      // history can't prove the update is a fast-forward — a shallow ref
+      // otherwise gets spuriously rejected as "non-fast-forward" on a repeat
+      // fetch of a branch that has moved on upstream.
+      await runGit(
+        [
+          'fetch',
+          '--depth',
+          '1',
+          'origin',
+          '--',
+          `+${targetBranch}:refs/remotes/origin/${targetBranch}`,
+        ],
+        safeTarget,
+        { token: options?.token, url },
+      );
+      // Reset the local branch onto the freshly fetched tip. These clones are
+      // analysis-only (never committed to), so discarding any local drift is
+      // correct and also wires up upstream tracking (start point is the
+      // remote-tracking ref, not FETCH_HEAD) for any subsequent plain pull.
+      await runGit(['checkout', '-B', targetBranch, `origin/${targetBranch}`], safeTarget, {
+        token: options?.token,
+        url,
+      });
+    } else {
+      onProgress?.({ phase: 'pulling', message: 'Pulling latest changes...' });
+      await runGit(['pull', '--ff-only'], safeTarget, { token: options?.token, url });
+    }
   } else {
     await fs.mkdir(path.dirname(safeTarget), { recursive: true });
-    onProgress?.({ phase: 'cloning', message: `Cloning ${url}...` });
-    await runGit(buildCloneArgs(url, safeTarget), undefined, { token: options?.token, url });
+    onProgress?.({
+      phase: 'cloning',
+      message: options?.branch ? `Cloning ${url} (${options.branch})...` : `Cloning ${url}...`,
+    });
+    await runGit(buildCloneArgs(url, safeTarget, options?.branch), undefined, {
+      token: options?.token,
+      url,
+    });
   }
 
   return safeTarget;
